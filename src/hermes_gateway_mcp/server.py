@@ -34,6 +34,19 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "hermes_steer_task",
+        "description": "Send additional instructions to an active Hermes run without starting a replacement run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The active Hermes run ID to steer.", "minLength": 1},
+                "instruction": {"type": "string", "description": "Additional guidance for the active Hermes run.", "minLength": 1},
+            },
+            "required": ["run_id", "instruction"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -42,6 +55,10 @@ class GatewayError(Exception):
 
 
 class UnknownRunError(GatewayError):
+    pass
+
+
+class InvalidRunStateError(GatewayError):
     pass
 
 
@@ -63,8 +80,10 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
             return json.loads(response.read())
     except HTTPError as exc:
         detail = exc.read().decode(errors="replace")
-        if exc.code == 404 and method == "GET":
+        if exc.code == 404:
             raise UnknownRunError("unknown Hermes run ID") from exc
+        if exc.code in {400, 409, 422} and method == "POST" and path.endswith("/steer"):
+            raise InvalidRunStateError("invalid run state: Hermes run is not steerable") from exc
         raise GatewayError(f"Hermes Gateway HTTP {exc.code}: {detail}") from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise GatewayError(f"Hermes Gateway unreachable: {exc}") from exc
@@ -154,6 +173,22 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
         try:
             response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}")
             return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
+        except GatewayError as exc:
+            return _error(str(exc))
+    if name == "hermes_steer_task":
+        run_id = arguments.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return _error("run_id must be a non-empty string")
+        instruction = arguments.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            return _error("instruction must be a non-empty string")
+        try:
+            _request("POST", f"/v1/runs/{quote(run_id, safe='')}/steer", {"text": instruction})
+            return {"content": [{"type": "text", "text": json.dumps({
+                "run_id": run_id,
+                "status": "accepted",
+                "message": f"steering instruction accepted for Hermes run {run_id}",
+            }, separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))
     return _error(f"unknown tool: {name}")
