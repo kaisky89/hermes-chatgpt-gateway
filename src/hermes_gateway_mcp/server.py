@@ -5,6 +5,7 @@ import os
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -40,6 +41,10 @@ class GatewayError(Exception):
     pass
 
 
+class UnknownRunError(GatewayError):
+    pass
+
+
 def _gateway_url() -> str:
     return os.getenv("HERMES_GATEWAY_URL", DEFAULT_GATEWAY_URL).rstrip("/")
 
@@ -58,6 +63,8 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
             return json.loads(response.read())
     except HTTPError as exc:
         detail = exc.read().decode(errors="replace")
+        if exc.code == 404 and method == "GET":
+            raise UnknownRunError("unknown Hermes run ID") from exc
         raise GatewayError(f"Hermes Gateway HTTP {exc.code}: {detail}") from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise GatewayError(f"Hermes Gateway unreachable: {exc}") from exc
@@ -66,7 +73,7 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
 
 
 def _normalized_status(status: Any) -> str:
-    value = str(status or "unknown").lower()
+    value = str(status or "unknown").strip().lower().replace(" ", "_")
     if value in {"queued", "pending", "created"}:
         return "queued"
     if value in {"running", "started", "in_progress", "in-progress", "active"}:
@@ -77,9 +84,27 @@ def _normalized_status(status: Any) -> str:
         return "failed"
     if value in {"stopped", "stop", "cancelled", "canceled", "interrupted"}:
         return "stopped"
-    if value in {"waiting_for_approval", "waiting_for_input", "intervention_required", "paused"}:
+    if value in {
+        "waiting",
+        "waiting_for_approval",
+        "waiting_for_input",
+        "waiting_for_intervention",
+        "intervention_required",
+        "approval_required",
+        "paused",
+    }:
         return "waiting"
     return value
+
+
+def _failure_summary(run: dict[str, Any]) -> Any:
+    for key in ("error_summary", "failure", "error", "reason", "message"):
+        value = run.get(key)
+        if value is not None:
+            if isinstance(value, dict):
+                return value.get("message") or value.get("detail") or value
+            return value
+    return None
 
 
 def _run_response(run: dict[str, Any]) -> dict[str, Any]:
@@ -88,10 +113,21 @@ def _run_response(run: dict[str, Any]) -> dict[str, Any]:
         raise GatewayError("Hermes Gateway response did not include a run ID")
     original = run.get("status", run.get("state"))
     result = {"run_id": run_id, "status": _normalized_status(original), "hermes_status": original}
-    if "output" in run and run["output"] is not None:
-        result["result"] = run["output"]
-    elif "result" in run and run["result"] is not None:
-        result["result"] = run["result"]
+
+    timestamps = run.get("timestamps")
+    if isinstance(timestamps, dict):
+        result["timestamps"] = timestamps
+    for key, value in run.items():
+        if key.endswith("_at") and value is not None:
+            result[key] = value
+
+    output = run.get("output", run.get("result"))
+    if output is not None:
+        result["result"] = output
+    if result["status"] == "failed":
+        summary = _failure_summary(run)
+        if summary is not None:
+            result["error_summary"] = summary
     return result
 
 
@@ -116,7 +152,7 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
         if not isinstance(run_id, str) or not run_id.strip():
             return _error("run_id must be a non-empty string")
         try:
-            response = _request("GET", f"/v1/runs/{run_id}")
+            response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}")
             return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))

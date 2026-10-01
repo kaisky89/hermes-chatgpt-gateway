@@ -6,6 +6,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 
 class HermesStub(BaseHTTPRequestHandler):
@@ -29,14 +30,14 @@ class HermesStub(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         prompt = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) ["input"]
-        run_id = "run-stable-1"
+        run_id = "run-stable-1" if prompt in {"inspect the local service", "persist in Hermes"} else f"run-{len(self.runs) + 1}"
         self.starts.append(prompt)
         self.runs[run_id] = {"run_id": run_id, "status": "running"}
         self.ready.set()
         self._json(202, {"run_id": run_id, "status": "running"})
 
     def do_GET(self):
-        run_id = self.path.removeprefix("/v1/runs/")
+        run_id = unquote(self.path.removeprefix("/v1/runs/"))
         run = self.runs.get(run_id)
         if run is None:
             self._json(404, {"error": "unknown run"})
@@ -157,7 +158,8 @@ def test_status_works_after_adapter_restart_without_local_run_store():
         status = rpc(second, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "hermes_get_task", "arguments": {"run_id": run_id}
         }})
-        assert json.loads(status["result"]["content"][0]["text"])["run_id"] == run_id
+        restarted_data = json.loads(status["result"]["content"][0]["text"])
+        assert restarted_data == {"run_id": run_id, "status": "running", "hermes_status": "running"}
     finally:
         if first.poll() is None:
             first.kill()
@@ -165,4 +167,93 @@ def test_status_works_after_adapter_restart_without_local_run_store():
         if second is not None:
             second.kill()
             second.wait()
+        stub.shutdown()
+
+
+def call_task(proc, request_id, name, arguments):
+    response = rpc(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+        "name": name, "arguments": arguments
+    }})
+    assert response["result"].get("isError") is not True
+    return json.loads(response["result"]["content"][0]["text"])
+
+
+def test_public_mcp_normalizes_all_supported_lifecycle_states_and_preserves_metadata():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        states = {
+            "queued": "pending",
+            "running": "active",
+            "completed": "succeeded",
+            "failed": "error",
+            "stopped": "cancelled",
+            "waiting": "waiting_for_approval",
+        }
+        for expected, native in states.items():
+            run_id = f"run-{expected}"
+            HermesStub.runs[run_id] = {
+                "run_id": run_id,
+                "state": native,
+                "created_at": "2026-10-01T10:00:00Z",
+                "started_at": "2026-10-01T10:00:01Z",
+                "updated_at": "2026-10-01T10:00:02Z",
+            }
+            if expected == "completed":
+                HermesStub.runs[run_id]["result"] = {"answer": 42}
+            if expected == "failed":
+                HermesStub.runs[run_id]["error"] = {"message": "tool execution failed"}
+            data = call_task(proc, expected, "hermes_get_task", {"run_id": run_id})
+            assert data["status"] == expected
+            assert data["hermes_status"] == native
+            assert data["created_at"] == "2026-10-01T10:00:00Z"
+            assert data["updated_at"] == "2026-10-01T10:00:02Z"
+            if expected == "completed":
+                assert data["result"] == {"answer": 42}
+            if expected == "failed":
+                assert data["error_summary"] == "tool execution failed"
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_isolates_multiple_runs_and_returns_stable_unknown_id_error():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        first = call_task(proc, 2, "hermes_start_task", {"prompt": "first independent run"})
+        second = call_task(proc, 3, "hermes_start_task", {"prompt": "second independent run"})
+        HermesStub.runs[first["run_id"]] = {"run_id": first["run_id"], "status": "completed", "output": "first result"}
+        HermesStub.runs[second["run_id"]] = {"run_id": second["run_id"], "status": "failed", "error": "second failed"}
+        assert call_task(proc, 4, "hermes_get_task", {"run_id": first["run_id"]})["result"] == "first result"
+        assert call_task(proc, 5, "hermes_get_task", {"run_id": second["run_id"]})["error_summary"] == "second failed"
+        unknown = rpc(proc, {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+            "name": "hermes_get_task", "arguments": {"run_id": "does-not-exist"}
+        }})
+        assert unknown["result"] == {"content": [{"type": "text", "text": "unknown Hermes run ID"}], "isError": True}
+        invalid = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "hermes_get_task", "arguments": {"run_id": "   "}
+        }})
+        assert invalid["result"] == {"content": [{"type": "text", "text": "run_id must be a non-empty string"}], "isError": True}
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_treats_run_id_as_one_opaque_path_segment():
+    stub = start_stub()
+    special_id = "run/with?reserved#characters"
+    HermesStub.runs[special_id] = {"run_id": special_id, "status": "completed", "output": "opaque"}
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_get_task", {"run_id": special_id})
+        assert data == {"run_id": special_id, "status": "completed", "hermes_status": "completed", "result": "opaque"}
+    finally:
+        proc.kill()
+        proc.wait()
         stub.shutdown()
