@@ -13,6 +13,7 @@ class HermesStub(BaseHTTPRequestHandler):
     runs = {}
     starts = []
     steers = []
+    stops = []
     ready = threading.Event()
     create_not_found = False
 
@@ -28,6 +29,22 @@ class HermesStub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_POST(self):
+        if self.path.startswith("/v1/runs/") and self.path.endswith("/stop"):
+            run_id = unquote(self.path[len("/v1/runs/") : -len("/stop")])
+            run = self.runs.get(run_id)
+            if run is None:
+                self._json(404, {"error": "unknown run"})
+                return
+            if run.get("stop_failure"):
+                self._json(503, {"error": "stop backend unavailable"})
+                return
+            if run.get("status") != "running":
+                self._json(409, {"error": "already terminal"})
+                return
+            self.stops.append(run_id)
+            run["status"] = "stopped"
+            self._json(200, {"run_id": run_id, "status": "stopped"})
+            return
         if self.path.startswith("/v1/runs/") and self.path.endswith("/steer"):
             run_id = unquote(self.path[len("/v1/runs/") : -len("/steer")])
             run = self.runs.get(run_id)
@@ -79,6 +96,7 @@ def start_stub():
     HermesStub.runs.clear()
     HermesStub.starts.clear()
     HermesStub.steers.clear()
+    HermesStub.stops.clear()
     HermesStub.ready.clear()
     HermesStub.create_not_found = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), HermesStub)
@@ -110,11 +128,14 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
 
         tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = {tool["name"] for tool in tools["result"]["tools"]}
-        assert {"hermes_start_task", "hermes_get_task", "hermes_steer_task"} <= names
+        assert {"hermes_start_task", "hermes_get_task", "hermes_steer_task", "hermes_stop_task"} <= names
         steer_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_steer_task")["inputSchema"]
         assert steer_schema["required"] == ["run_id", "instruction"]
         assert steer_schema["properties"]["run_id"]["minLength"] == 1
         assert steer_schema["properties"]["instruction"]["minLength"] == 1
+        stop_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_stop_task")["inputSchema"]
+        assert stop_schema["required"] == ["run_id"]
+        assert stop_schema["properties"]["run_id"]["minLength"] == 1
         start_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_start_task")["inputSchema"]
         assert start_schema["required"] == ["prompt"]
         assert start_schema["properties"]["prompt"]["minLength"] == 1
@@ -413,6 +434,71 @@ def test_public_mcp_does_not_misclassify_unrelated_create_route_404():
         assert error["status"] == 404
         assert error["error"]["code"] == "route_not_found"
         assert error["error"]["code"] != "run_not_found"
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+
+def test_public_mcp_stops_active_run_and_preserves_concurrent_run_isolation():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        first = call_task(proc, 2, "hermes_start_task", {"prompt": "first stoppable run"})
+        second = call_task(proc, 3, "hermes_start_task", {"prompt": "second stoppable run"})
+        HermesStub.runs[first["run_id"]]["status"] = "running"
+        HermesStub.runs[second["run_id"]]["status"] = "running"
+        stopped = call_task(proc, 4, "hermes_stop_task", {"run_id": first["run_id"]})
+        assert stopped == {"run_id": first["run_id"], "status": "stopped", "hermes_status": "stopped"}
+        assert HermesStub.stops == [first["run_id"]]
+        assert call_task(proc, 5, "hermes_get_task", {"run_id": first["run_id"]})["status"] == "stopped"
+        assert call_task(proc, 6, "hermes_get_task", {"run_id": second["run_id"]})["status"] == "running"
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_stop_has_predictable_terminal_and_repeated_behavior():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        HermesStub.runs["completed-run"] = {"run_id": "completed-run", "status": "completed"}
+        HermesStub.runs["stopped-run"] = {"run_id": "stopped-run", "status": "stopped"}
+        for request_id, run_id in [(2, "completed-run"), (3, "stopped-run")]:
+            response = rpc(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                "name": "hermes_stop_task", "arguments": {"run_id": run_id}
+            }})
+            assert response["result"] == {
+                "content": [{"type": "text", "text": "invalid run state: Hermes run is not stoppable"}],
+                "isError": True,
+            }
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_stop_maps_unknown_and_downstream_failures_clearly():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        unknown = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_stop_task", "arguments": {"run_id": "does-not-exist"}
+        }})
+        assert unknown["result"] == {"content": [{"type": "text", "text": "unknown Hermes run ID"}], "isError": True}
+        HermesStub.runs["failure-run"] = {"run_id": "failure-run", "status": "running", "stop_failure": True}
+        failed = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "hermes_stop_task", "arguments": {"run_id": "failure-run"}
+        }})
+        assert failed["result"] == {
+            "content": [{"type": "text", "text": "Hermes stop failed (HTTP 503): {\"error\": \"stop backend unavailable\"}"}],
+            "isError": True,
+        }
     finally:
         proc.kill()
         proc.wait()

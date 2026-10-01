@@ -47,10 +47,28 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "hermes_stop_task",
+        "description": "Request cancellation of one Hermes run and return the downstream cancellation result for that run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string", "description": "The Hermes run ID to stop.", "minLength": 1}},
+            "required": ["run_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
 class GatewayError(Exception):
+    pass
+
+
+class UnknownRunError(GatewayError):
+    pass
+
+
+class InvalidRunStateError(GatewayError):
     pass
 
 
@@ -65,6 +83,10 @@ class GatewayHTTPError(GatewayError):
         else:
             payload = {"status": self.status, "body": self.body}
         return json.dumps(payload, separators=(",", ":"))
+
+
+class StopFailureError(GatewayError):
+    pass
 
 
 def _gateway_url() -> str:
@@ -84,8 +106,21 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
         with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             return json.loads(response.read())
     except HTTPError as exc:
+        raw_detail = exc.read()
+        detail = raw_detail.decode(errors="replace")
+        if method == "POST" and path.endswith("/stop"):
+            if exc.code == 404:
+                raise UnknownRunError("unknown Hermes run ID") from exc
+            lowered = detail.lower()
+            terminal_markers = (
+                "already_stopped", "already terminal", "not stoppable", "completed",
+                "cancelled", "canceled", "stopped",
+            )
+            if exc.code in {400, 409, 422} and any(marker in lowered for marker in terminal_markers):
+                raise InvalidRunStateError("invalid run state: Hermes run is not stoppable") from exc
+            raise StopFailureError(f"Hermes stop failed (HTTP {exc.code}): {detail}") from exc
         try:
-            body = json.loads(exc.read())
+            body = json.loads(raw_detail)
         except json.JSONDecodeError as error:
             raise GatewayError(f"Hermes Gateway HTTP {exc.code}: invalid JSON error response") from error
         raise GatewayHTTPError(exc.code, body) from exc
@@ -195,6 +230,19 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
                 "status": "accepted",
                 "message": f"steering instruction accepted for Hermes run {run_id}",
             }, separators=(",", ":"))}]}
+        except GatewayError as exc:
+            return _error(str(exc))
+    if name == "hermes_stop_task":
+        run_id = arguments.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return _error("run_id must be a non-empty string")
+        try:
+            response = _request("POST", f"/v1/runs/{quote(run_id, safe='')}/stop")
+            if not response:
+                response = {"run_id": run_id, "status": "stopped"}
+            else:
+                response.setdefault("run_id", run_id)
+            return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))
     return _error(f"unknown tool: {name}")
