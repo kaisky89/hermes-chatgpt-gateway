@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes ChatGPT MCP tunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/pi/.config/hermes-chatgpt-gateway/openai-tunnel.env
+EnvironmentFile=/home/pi/.config/hermes-chatgpt-gateway/hermes.env
+ExecStart=/home/pi/.local/bin/tunnel-client run --profile hermes-chatgpt
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

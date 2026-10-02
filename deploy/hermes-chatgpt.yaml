@@ -1,0 +1,13 @@
+config_version: 1
+
+control_plane:
+    base_url: https://api.openai.com
+    api_key: env:CONTROL_PLANE_API_KEY
+
+health:
+    listen_addr: 127.0.0.1:8081
+
+mcp:
+    commands:
+        - channel: main
+          command: "/home/pi/code/hermes-chatgpt-gateway/scripts/run-hermes-gateway-mcp"
