@@ -5,11 +5,13 @@ After=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/home/pi/code/hermes-chatgpt-gateway
+Environment=PATH=/home/pi/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/home/pi/.config/hermes-chatgpt-gateway/openai-tunnel.env
 EnvironmentFile=/home/pi/.config/hermes-chatgpt-gateway/hermes.env
-ExecStart=/home/pi/.local/bin/tunnel-client run --profile hermes-chatgpt
+ExecStart=/home/pi/code/hermes-chatgpt-gateway/scripts/run-hermes-chatgpt-tunnel
 Restart=on-failure
-RestartSec=5
+RestartSec=5s
 
 [Install]
 WantedBy=default.target
