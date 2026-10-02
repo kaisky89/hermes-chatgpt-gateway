@@ -64,14 +64,6 @@ class GatewayError(Exception):
     pass
 
 
-class UnknownRunError(GatewayError):
-    pass
-
-
-class InvalidRunStateError(GatewayError):
-    pass
-
-
 class GatewayHTTPError(GatewayError):
     def __init__(self, status: int, body: Any):
         self.status = status
@@ -83,10 +75,6 @@ class GatewayHTTPError(GatewayError):
         else:
             payload = {"status": self.status, "body": self.body}
         return json.dumps(payload, separators=(",", ":"))
-
-
-class StopFailureError(GatewayError):
-    pass
 
 
 def _gateway_url() -> str:
@@ -107,18 +95,6 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
             return json.loads(response.read())
     except HTTPError as exc:
         raw_detail = exc.read()
-        detail = raw_detail.decode(errors="replace")
-        if method == "POST" and path.endswith("/stop"):
-            if exc.code == 404:
-                raise UnknownRunError("unknown Hermes run ID") from exc
-            lowered = detail.lower()
-            terminal_markers = (
-                "already_stopped", "already terminal", "not stoppable", "completed",
-                "cancelled", "canceled", "stopped",
-            )
-            if exc.code in {400, 409, 422} and any(marker in lowered for marker in terminal_markers):
-                raise InvalidRunStateError("invalid run state: Hermes run is not stoppable") from exc
-            raise StopFailureError(f"Hermes stop failed (HTTP {exc.code}): {detail}") from exc
         try:
             body = json.loads(raw_detail)
         except json.JSONDecodeError as error:
@@ -142,7 +118,9 @@ def _normalized_status(status: Any) -> str:
         return "completed"
     if value in {"failed", "failure", "error"}:
         return "failed"
-    if value in {"stopped", "stopping", "stop", "cancelled", "canceled", "interrupted"}:
+    if value in {"stopping", "stop"}:
+        return "stopping"
+    if value in {"stopped", "cancelled", "canceled", "interrupted"}:
         return "stopped"
     if value in {
         "waiting",
@@ -238,10 +216,6 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
             return _error("run_id must be a non-empty string")
         try:
             response = _request("POST", f"/v1/runs/{quote(run_id, safe='')}/stop")
-            if not response:
-                response = {"run_id": run_id, "status": "stopped"}
-            else:
-                response.setdefault("run_id", run_id)
             return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))
