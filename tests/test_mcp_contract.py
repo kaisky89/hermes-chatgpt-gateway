@@ -103,16 +103,31 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
         request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
             "name": "hermes_start_task", "arguments": {"prompt": "inspect the local service"}
         }}
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            started_future = pool.submit(rpc, proc, request)
-            assert HermesStub.ready.wait(timeout=1), "Hermes did not receive the start request"
+        pool = ThreadPoolExecutor(max_workers=1)
+        started_future = pool.submit(rpc, proc, request)
+        release_completion = False
+        try:
+            if not HermesStub.ready.wait(timeout=1):
+                release_completion = True
+                proc.kill()
+                proc.wait()
+                started_future.result(timeout=1)
+                raise AssertionError("Hermes did not receive the start request")
             try:
                 started = started_future.result(timeout=1)
                 returned_while_running = True
             except FutureTimeoutError:
+                release_completion = True
                 HermesStub.completion_released.set()
                 started = started_future.result(timeout=1)
                 returned_while_running = False
+        finally:
+            if release_completion:
+                HermesStub.completion_released.set()
+            if not started_future.done() and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            pool.shutdown(wait=True, cancel_futures=True)
         assert returned_while_running, "start waited for the simulated Hermes run to complete"
         start_data = json.loads(started["result"]["content"][0]["text"])
         assert start_data == {"run_id": "run-stable-1", "status": "running", "hermes_status": "running"}
