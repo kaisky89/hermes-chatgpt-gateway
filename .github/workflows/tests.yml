@@ -30,5 +30,6 @@ jobs:
       - name: Run validation checks
         run: |
           uv run --with pytest pytest -vv
+          uv run --with ruff ruff check .
           uv run python -m compileall -q src tests
           git diff --check
