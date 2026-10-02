@@ -5,7 +5,7 @@ A small MCP adapter that exposes Hermes Gateway runs to MCP clients.
 ## What it exposes
 
 - `hermes_start_task`: submits a prompt to `POST /v1/runs` and returns immediately with Hermes' `run_id`.
-- `hermes_get_task`: reads `GET /v1/runs/{run_id}` and returns normalized status plus the completed `output` when present.
+- `hermes_get_task`: reads `GET /v1/runs/{run_id}` and returns normalized lifecycle status, the native Hermes status, available lifecycle timestamps, a completed `result`, or a failed-run `error_summary` when present.
 
 The adapter keeps no run database, worker, or polling loop. Hermes remains the source of truth.
 
