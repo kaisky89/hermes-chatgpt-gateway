@@ -29,6 +29,6 @@ jobs:
 
       - name: Run validation checks
         run: |
-          uv run --with pytest pytest -q
+          uv run --with pytest pytest -vv
           uv run python -m compileall -q src tests
           git diff --check
