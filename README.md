@@ -7,6 +7,7 @@ A small MCP adapter that exposes Hermes Gateway runs to MCP clients.
 - `hermes_start_task`: submits a prompt to `POST /v1/runs` and returns immediately with Hermes' `run_id`.
 - `hermes_get_task`: reads `GET /v1/runs/{run_id}` and returns normalized lifecycle status, the native Hermes status, available lifecycle timestamps, a completed `result`, or a failed-run `error_summary` when present.
 - `hermes_steer_task`: submits additional instruction text to `POST /v1/runs/{run_id}/steer` for an active run and returns a run-specific acknowledgement.
+- `hermes_stop_task`: requests cancellation with `POST /v1/runs/{run_id}/stop` and returns Hermes' response through the same run shaping as status reads. An active run returns the immediate `stopping` acknowledgement; a later status read returns Hermes' terminal state. Existing terminal states and structured Hermes domain errors are forwarded without stop-specific remapping.
 
 The adapter keeps no run database, worker, or polling loop. Hermes remains the source of truth.
 
@@ -79,4 +80,4 @@ uv run --with pytest pytest
 
 The contract tests launch the adapter through its public MCP protocol and use a local controlled Hermes-compatible HTTP stub. They cover discovery, prompt validation, asynchronous start, active and completed status, stable run IDs, and adapter restart without a local job store.
 
-The downstream paths and payloads follow the documented Hermes Runs API: `POST /v1/runs` with an `input` string, then `GET /v1/runs/{run_id}`.
+The downstream paths and payloads follow the documented Hermes Runs API: `POST /v1/runs` with an `input` string, `GET /v1/runs/{run_id}`, `POST /v1/runs/{run_id}/steer` with a `text` string, and `POST /v1/runs/{run_id}/stop`.

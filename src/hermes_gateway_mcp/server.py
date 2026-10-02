@@ -47,6 +47,16 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "hermes_stop_task",
+        "description": "Request cancellation of one Hermes run and return the downstream cancellation result for that run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string", "description": "The Hermes run ID to stop.", "minLength": 1}},
+            "required": ["run_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -84,8 +94,9 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
         with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             return json.loads(response.read())
     except HTTPError as exc:
+        raw_detail = exc.read()
         try:
-            body = json.loads(exc.read())
+            body = json.loads(raw_detail)
         except json.JSONDecodeError as error:
             raise GatewayError(f"Hermes Gateway HTTP {exc.code}: invalid JSON error response") from error
         raise GatewayHTTPError(exc.code, body) from exc
@@ -107,7 +118,9 @@ def _normalized_status(status: Any) -> str:
         return "completed"
     if value in {"failed", "failure", "error"}:
         return "failed"
-    if value in {"stopped", "stopping", "stop", "cancelled", "canceled", "interrupted"}:
+    if value in {"stopping", "stop"}:
+        return "stopping"
+    if value in {"stopped", "cancelled", "canceled", "interrupted"}:
         return "stopped"
     if value in {
         "waiting",
@@ -195,6 +208,15 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
                 "status": "accepted",
                 "message": f"steering instruction accepted for Hermes run {run_id}",
             }, separators=(",", ":"))}]}
+        except GatewayError as exc:
+            return _error(str(exc))
+    if name == "hermes_stop_task":
+        run_id = arguments.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return _error("run_id must be a non-empty string")
+        try:
+            response = _request("POST", f"/v1/runs/{quote(run_id, safe='')}/stop")
+            return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))
     return _error(f"unknown tool: {name}")
