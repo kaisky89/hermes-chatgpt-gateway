@@ -54,12 +54,17 @@ class GatewayError(Exception):
     pass
 
 
-class UnknownRunError(GatewayError):
-    pass
+class GatewayHTTPError(GatewayError):
+    def __init__(self, status: int, body: Any):
+        self.status = status
+        self.body = body
 
-
-class InvalidRunStateError(GatewayError):
-    pass
+    def __str__(self) -> str:
+        if isinstance(self.body, dict):
+            payload = {"status": self.status, **self.body}
+        else:
+            payload = {"status": self.status, "body": self.body}
+        return json.dumps(payload, separators=(",", ":"))
 
 
 def _gateway_url() -> str:
@@ -79,16 +84,17 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> d
         with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             return json.loads(response.read())
     except HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        if exc.code == 404:
-            raise UnknownRunError("unknown Hermes run ID") from exc
-        if exc.code in {400, 409, 422} and method == "POST" and path.endswith("/steer"):
-            raise InvalidRunStateError("invalid run state: Hermes run is not steerable") from exc
-        raise GatewayError(f"Hermes Gateway HTTP {exc.code}: {detail}") from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise GatewayError(f"Hermes Gateway unreachable: {exc}") from exc
+        try:
+            body = json.loads(exc.read())
+        except json.JSONDecodeError as error:
+            raise GatewayError(f"Hermes Gateway HTTP {exc.code}: invalid JSON error response") from error
+        raise GatewayHTTPError(exc.code, body) from exc
     except json.JSONDecodeError as exc:
         raise GatewayError("Hermes Gateway returned invalid JSON") from exc
+    except (URLError, TimeoutError, OSError):
+        raise GatewayError("Hermes Gateway unreachable") from None
+    except ValueError:
+        raise GatewayError("invalid Hermes Gateway configuration") from None
 
 
 def _normalized_status(status: Any) -> str:
