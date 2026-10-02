@@ -12,7 +12,9 @@ from urllib.parse import unquote
 class HermesStub(BaseHTTPRequestHandler):
     runs = {}
     starts = []
+    steers = []
     ready = threading.Event()
+    create_not_found = False
 
     def log_message(self, *_args):
         pass
@@ -26,8 +28,30 @@ class HermesStub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_POST(self):
+        if self.path.startswith("/v1/runs/") and self.path.endswith("/steer"):
+            run_id = unquote(self.path[len("/v1/runs/") : -len("/steer")])
+            run = self.runs.get(run_id)
+            if run is None:
+                self._json(404, {"error": {"message": "run not found", "type": "invalid_request_error", "code": "run_not_found", "param": None}})
+                return
+            if run.get("status") != "running":
+                self._json(409, {"error": {"message": "run is not accepting steer", "type": "invalid_request_error", "code": "run_not_accepting_steer", "param": None}})
+                return
+            instruction = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) ["text"]
+            if instruction == "invalid input":
+                self._json(400, {"error": {"message": "invalid steer input", "type": "invalid_request_error", "code": "invalid_steer_input", "param": "text"}})
+                return
+            if instruction == "race lost":
+                self._json(409, {"error": {"message": "steer was not accepted", "type": "conflict_error", "code": "steer_not_accepted", "param": None}})
+                return
+            self.steers.append((run_id, instruction))
+            self._json(200, {"run_id": run_id, "status": "accepted"})
+            return
         if self.path != "/v1/runs":
-            self._json(404, {"error": "not found"})
+            self._json(404, {"error": {"message": "not found", "type": "invalid_request_error", "code": "route_not_found", "param": None}})
+            return
+        if getattr(self, "create_not_found", False):
+            self._json(404, {"error": {"message": "create route not found", "type": "invalid_request_error", "code": "route_not_found", "param": None}})
             return
         prompt = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) ["input"]
         run_id = "run-stable-1" if prompt in {"inspect the local service", "persist in Hermes"} else f"run-{len(self.runs) + 1}"
@@ -40,7 +64,7 @@ class HermesStub(BaseHTTPRequestHandler):
         run_id = unquote(self.path.removeprefix("/v1/runs/"))
         run = self.runs.get(run_id)
         if run is None:
-            self._json(404, {"error": "unknown run"})
+            self._json(404, {"error": {"message": "run not found", "type": "invalid_request_error", "code": "run_not_found", "param": None}})
             return
         self._json(200, run)
 
@@ -54,7 +78,9 @@ def rpc(proc, request):
 def start_stub():
     HermesStub.runs.clear()
     HermesStub.starts.clear()
+    HermesStub.steers.clear()
     HermesStub.ready.clear()
+    HermesStub.create_not_found = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), HermesStub)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -84,7 +110,11 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
 
         tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = {tool["name"] for tool in tools["result"]["tools"]}
-        assert {"hermes_start_task", "hermes_get_task"} <= names
+        assert {"hermes_start_task", "hermes_get_task", "hermes_steer_task"} <= names
+        steer_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_steer_task")["inputSchema"]
+        assert steer_schema["required"] == ["run_id", "instruction"]
+        assert steer_schema["properties"]["run_id"]["minLength"] == 1
+        assert steer_schema["properties"]["instruction"]["minLength"] == 1
         start_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_start_task")["inputSchema"]
         assert start_schema["required"] == ["prompt"]
         assert start_schema["properties"]["prompt"]["minLength"] == 1
@@ -234,7 +264,7 @@ def test_public_mcp_normalizes_transient_stopping_to_stopped():
         stub.shutdown()
 
 
-def test_public_mcp_isolates_multiple_runs_and_returns_stable_unknown_id_error():
+def test_public_mcp_isolates_multiple_runs_and_preserves_gateway_error_details():
     stub = start_stub()
     proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
     try:
@@ -248,7 +278,17 @@ def test_public_mcp_isolates_multiple_runs_and_returns_stable_unknown_id_error()
         unknown = rpc(proc, {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
             "name": "hermes_get_task", "arguments": {"run_id": "does-not-exist"}
         }})
-        assert unknown["result"] == {"content": [{"type": "text", "text": "unknown Hermes run ID"}], "isError": True}
+        assert unknown["result"]["isError"] is True
+        unknown_error = json.loads(unknown["result"]["content"][0]["text"])
+        assert unknown_error == {
+            "status": 404,
+            "error": {
+                "message": "run not found",
+                "type": "invalid_request_error",
+                "code": "run_not_found",
+                "param": None,
+            },
+        }
         invalid = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
             "name": "hermes_get_task", "arguments": {"run_id": "   "}
         }})
@@ -268,6 +308,111 @@ def test_public_mcp_treats_run_id_as_one_opaque_path_segment():
         rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         data = call_task(proc, 2, "hermes_get_task", {"run_id": special_id})
         assert data == {"run_id": special_id, "status": "completed", "hermes_status": "completed", "result": "opaque"}
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_steers_active_run_and_isolates_concurrent_runs():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        first = call_task(proc, 2, "hermes_start_task", {"prompt": "first steerable run"})
+        second = call_task(proc, 3, "hermes_start_task", {"prompt": "second steerable run"})
+        HermesStub.runs[first["run_id"]] = {"run_id": first["run_id"], "status": "running"}
+        HermesStub.runs[second["run_id"]] = {"run_id": second["run_id"], "status": "running"}
+
+        steered = call_task(proc, 4, "hermes_steer_task", {
+            "run_id": second["run_id"], "instruction": "also inspect the deployment manifest"
+        })
+        assert steered == {
+            "run_id": second["run_id"],
+            "status": "accepted",
+            "message": f"steering instruction accepted for Hermes run {second['run_id']}",
+        }
+        assert HermesStub.steers == [(second["run_id"], "also inspect the deployment manifest")]
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_steering_validates_inputs_and_preserves_gateway_errors():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        for request_id, arguments, expected in [
+            (2, {"instruction": "continue"}, "run_id must be a non-empty string"),
+            (3, {"run_id": "run-1", "instruction": "   "}, "instruction must be a non-empty string"),
+        ]:
+            invalid = rpc(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                "name": "hermes_steer_task", "arguments": arguments
+            }})
+            assert invalid["result"] == {"content": [{"type": "text", "text": expected}], "isError": True}
+
+        unknown = rpc(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "hermes_steer_task", "arguments": {
+                "run_id": "missing-run", "instruction": "continue"
+            }
+        }})
+        unknown_error = json.loads(unknown["result"]["content"][0]["text"])
+        assert unknown_error == {
+            "status": 404,
+            "error": {
+                "message": "run not found",
+                "type": "invalid_request_error",
+                "code": "run_not_found",
+                "param": None,
+            },
+        }
+
+        HermesStub.runs["terminal-run"] = {"run_id": "terminal-run", "status": "completed"}
+        terminal = rpc(proc, {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "hermes_steer_task", "arguments": {
+                "run_id": "terminal-run", "instruction": "continue anyway"
+            }
+        }})
+        terminal_error = json.loads(terminal["result"]["content"][0]["text"])
+        assert terminal_error["status"] == 409
+        assert terminal_error["error"]["code"] == "run_not_accepting_steer"
+
+        HermesStub.runs["running-run"] = {"run_id": "running-run", "status": "running"}
+        for request_id, instruction, status, code in [
+            (6, "invalid input", 400, "invalid_steer_input"),
+            (7, "race lost", 409, "steer_not_accepted"),
+        ]:
+            rejected = rpc(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                "name": "hermes_steer_task", "arguments": {
+                    "run_id": "running-run", "instruction": instruction
+                }
+            }})
+            assert rejected["result"]["isError"] is True
+            error = json.loads(rejected["result"]["content"][0]["text"])
+            assert error["status"] == status
+            assert error["error"]["code"] == code
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_does_not_misclassify_unrelated_create_route_404():
+    stub = start_stub()
+    HermesStub.create_not_found = True
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_start_task", "arguments": {"prompt": "will fail at create"}
+        }})
+        assert response["result"]["isError"] is True
+        error = json.loads(response["result"]["content"][0]["text"])
+        assert error["status"] == 404
+        assert error["error"]["code"] == "route_not_found"
+        assert error["error"]["code"] != "run_not_found"
     finally:
         proc.kill()
         proc.wait()
