@@ -6,15 +6,16 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import unquote
 
 
 class HermesStub(BaseHTTPRequestHandler):
-    runs = {}
-    starts = []
-    steers = []
-    stops = []
-    ready = threading.Event()
+    runs: ClassVar[dict] = {}
+    starts: ClassVar[list] = []
+    steers: ClassVar[list] = []
+    stops: ClassVar[list] = []
+    ready: ClassVar[threading.Event] = threading.Event()
     create_not_found = False
 
     def log_message(self, *_args):
@@ -106,15 +107,17 @@ def start_stub():
     return server
 
 
-def start_adapter(url):
+def start_adapter(url, **settings):
     env = os.environ.copy()
     env["HERMES_GATEWAY_URL"] = url
+    env.update(settings)
     return subprocess.Popen(
         [sys.executable, "-m", "hermes_gateway_mcp.server"],
         cwd=Path(__file__).parents[1],
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
     )
@@ -314,7 +317,7 @@ def test_public_mcp_isolates_multiple_runs_and_preserves_gateway_error_details()
         invalid = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
             "name": "hermes_get_task", "arguments": {"run_id": "   "}
         }})
-        assert invalid["result"] == {"content": [{"type": "text", "text": "run_id must be a non-empty string"}], "isError": True}
+        assert invalid["result"] == {"content": [{"type": "text", "text": "invalid input: run_id must be a non-empty string"}], "isError": True}
     finally:
         proc.kill()
         proc.wait()
@@ -373,7 +376,7 @@ def test_public_mcp_steering_validates_inputs_and_preserves_gateway_errors():
             invalid = rpc(proc, {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
                 "name": "hermes_steer_task", "arguments": arguments
             }})
-            assert invalid["result"] == {"content": [{"type": "text", "text": expected}], "isError": True}
+            assert invalid["result"] == {"content": [{"type": "text", "text": f"invalid input: {expected}"}], "isError": True}
 
         unknown = rpc(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
             "name": "hermes_steer_task", "arguments": {
@@ -506,3 +509,161 @@ def test_public_mcp_stop_preserves_structured_hermes_domain_errors():
         proc.kill()
         proc.wait()
         stub.shutdown()
+
+
+class AuthenticatedStub(HermesStub):
+    expected_key = "test-secret"
+    seen_authorizations: ClassVar[list] = []
+
+    def _authorized(self):
+        value = self.headers.get("Authorization")
+        self.seen_authorizations.append(value)
+        if value != f"Bearer {self.expected_key}":
+            self._json(401, {"error": {"message": "invalid token", "code": "invalid_api_key"}})
+            return False
+        return True
+
+    def do_POST(self):
+        if self._authorized():
+            super().do_POST()
+
+    def do_GET(self):
+        if self._authorized():
+            super().do_GET()
+
+
+def test_hardening_uses_runtime_api_key_without_discovery_or_log_disclosure():
+    AuthenticatedStub.runs.clear()
+    AuthenticatedStub.starts.clear()
+    AuthenticatedStub.steers.clear()
+    AuthenticatedStub.stops.clear()
+    AuthenticatedStub.seen_authorizations.clear()
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), AuthenticatedStub)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_GATEWAY_API_KEY="test-secret")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        discovery = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        assert "test-secret" not in json.dumps(discovery)
+        started = call_task(proc, 3, "hermes_start_task", {"prompt": "secret prompt"})
+        HermesStub.runs[started["run_id"]]["status"] = "running"
+        call_task(proc, 4, "hermes_get_task", {"run_id": started["run_id"]})
+        call_task(proc, 5, "hermes_steer_task", {"run_id": started["run_id"], "instruction": "continue"})
+        call_task(proc, 6, "hermes_stop_task", {"run_id": started["run_id"]})
+        assert AuthenticatedStub.seen_authorizations == ["Bearer test-secret"] * 4
+    finally:
+        proc.kill()
+        _, logs = proc.communicate()
+        assert "test-secret" not in logs
+        assert "secret prompt" not in logs
+        stub.shutdown()
+
+
+def test_hardening_preserves_structured_steer_domain_error_without_adapter_taxonomy():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_steer_task", "arguments": {"run_id": "missing-run", "instruction": "continue"}
+        }})
+        assert json.loads(response["result"]["content"][0]["text"]) == {
+            "status": 404,
+            "error": {"message": "run not found", "type": "invalid_request_error", "code": "run_not_found", "param": None},
+        }
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_hardening_rejects_empty_and_malformed_gateway_responses():
+    class EmptyStub(HermesStub):
+        def do_POST(self):
+            if self.path.endswith("/stop"):
+                self.send_response(204)
+                self.end_headers()
+                return
+            super().do_POST()
+
+    class MalformedStub(HermesStub):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"not-json")
+
+    for handler, expected in [(EmptyStub, "malformed/unexpected response: Gateway response body was empty"), (MalformedStub, "malformed/unexpected response: Gateway returned invalid JSON")]:
+        stub = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+        try:
+            rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            name = "hermes_stop_task" if handler is EmptyStub else "hermes_get_task"
+            response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": {"run_id": "run-1"}}})
+            assert response["result"] == {"content": [{"type": "text", "text": expected}], "isError": True}
+        finally:
+            proc.kill()
+            proc.wait()
+            stub.shutdown()
+
+
+def test_hardening_rejects_invalid_credentials_without_secret_disclosure():
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), AuthenticatedStub)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_GATEWAY_API_KEY="wrong-secret")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_get_task", "arguments": {"run_id": "run-1"}
+        }})
+        assert response["result"] == {"content": [{"type": "text", "text": "Gateway authentication failure: Gateway authentication failed"}], "isError": True}
+    finally:
+        proc.kill()
+        _, logs = proc.communicate()
+        assert "wrong-secret" not in logs
+        stub.shutdown()
+
+
+def test_hardening_enforces_configured_timeout():
+    class SlowStub(HermesStub):
+        def do_GET(self):
+            time.sleep(1)
+            super().do_GET()
+
+    stub = ThreadingHTTPServer(("127.0.0.1", 0), SlowStub)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_GATEWAY_TIMEOUT="0.05")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        began = time.monotonic()
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_get_task", "arguments": {"run_id": "slow"}
+        }})
+        assert time.monotonic() - began < 0.8
+        assert response["result"]["content"][0]["text"].startswith("Gateway connectivity/timeout failure:")
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_hardening_validates_url_and_timeout_configuration():
+    for url, settings in [
+        ("not-a-url", {}),
+        ("https://user:password@example.test", {}),
+        ("https://example.test/path?token=secret", {}),
+        ("https://example.test", {"HERMES_GATEWAY_TIMEOUT": "0"}),
+        ("https://example.test", {"HERMES_GATEWAY_TIMEOUT": "121"}),
+        ("https://example.test", {"HERMES_GATEWAY_TIMEOUT": "not-a-number"}),
+    ]:
+        proc = start_adapter(url, **settings)
+        try:
+            assert proc.wait(timeout=2) == 2
+            _, logs = proc.communicate()
+            assert "password" not in logs
+            assert "secret" not in logs
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
