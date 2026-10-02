@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+
+PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_GATEWAY_URL = "http://127.0.0.1:8642"
+TIMEOUT_SECONDS = float(os.getenv("HERMES_GATEWAY_TIMEOUT", "10"))
+
+TOOLS = [
+    {
+        "name": "hermes_start_task",
+        "description": "Start a natural-language task in Hermes asynchronously and return its stable run ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"prompt": {"type": "string", "description": "The objective for Hermes to execute.", "minLength": 1}},
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "hermes_get_task",
+        "description": "Retrieve the current status and, when complete, the result of a Hermes task by run ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string", "description": "The Hermes run ID returned by hermes_start_task.", "minLength": 1}},
+            "required": ["run_id"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+class GatewayError(Exception):
+    pass
+
+
+def _gateway_url() -> str:
+    return os.getenv("HERMES_GATEWAY_URL", DEFAULT_GATEWAY_URL).rstrip("/")
+
+
+def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    api_key = os.getenv("HERMES_GATEWAY_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = Request(f"{_gateway_url()}{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            return json.loads(response.read())
+    except HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise GatewayError(f"Hermes Gateway HTTP {exc.code}: {detail}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise GatewayError(f"Hermes Gateway unreachable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise GatewayError("Hermes Gateway returned invalid JSON") from exc
+
+
+def _normalized_status(status: Any) -> str:
+    value = str(status or "unknown").lower()
+    if value in {"queued", "pending", "created"}:
+        return "queued"
+    if value in {"running", "started", "in_progress", "in-progress", "active"}:
+        return "running"
+    if value in {"completed", "complete", "succeeded", "success", "done"}:
+        return "completed"
+    if value in {"failed", "failure", "error"}:
+        return "failed"
+    if value in {"stopped", "stop", "cancelled", "canceled", "interrupted"}:
+        return "stopped"
+    if value in {"waiting_for_approval", "waiting_for_input", "intervention_required", "paused"}:
+        return "waiting"
+    return value
+
+
+def _run_response(run: dict[str, Any]) -> dict[str, Any]:
+    run_id = run.get("id", run.get("run_id"))
+    if not isinstance(run_id, str) or not run_id:
+        raise GatewayError("Hermes Gateway response did not include a run ID")
+    original = run.get("status", run.get("state"))
+    result = {"run_id": run_id, "status": _normalized_status(original), "hermes_status": original}
+    if "output" in run and run["output"] is not None:
+        result["result"] = run["output"]
+    elif "result" in run and run["result"] is not None:
+        result["result"] = run["result"]
+    return result
+
+
+def _error(message: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return _error("arguments must be an object")
+    if name == "hermes_start_task":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return _error("prompt must be a non-empty string")
+        try:
+            response = _request("POST", "/v1/runs", {"input": prompt})
+            return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
+        except GatewayError as exc:
+            return _error(str(exc))
+    if name == "hermes_get_task":
+        run_id = arguments.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            return _error("run_id must be a non-empty string")
+        try:
+            response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}")
+            return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
+        except GatewayError as exc:
+            return _error(str(exc))
+    return _error(f"unknown tool: {name}")
+
+
+def _handle(request: dict[str, Any]) -> dict[str, Any] | None:
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "notifications/initialized":
+        return None
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hermes-gateway-mcp", "version": "0.1.0"},
+        }}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        params = request.get("params") or {}
+        return {"jsonrpc": "2.0", "id": request_id, "result": _call_tool(params.get("name"), params.get("arguments", {}))}
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
+def main() -> None:
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            response = _handle(request)
+            if response is not None:
+                sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+        except (json.JSONDecodeError, TypeError) as exc:
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
+            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
