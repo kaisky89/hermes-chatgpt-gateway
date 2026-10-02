@@ -5,6 +5,7 @@ import os
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -116,7 +117,7 @@ def _call_tool(name: str, arguments: Any) -> dict[str, Any]:
         if not isinstance(run_id, str) or not run_id.strip():
             return _error("run_id must be a non-empty string")
         try:
-            response = _request("GET", f"/v1/runs/{run_id}")
+            response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}")
             return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
         except GatewayError as exc:
             return _error(str(exc))

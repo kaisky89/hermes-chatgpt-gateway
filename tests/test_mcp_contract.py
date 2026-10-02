@@ -3,7 +3,8 @@ import os
 import subprocess
 import sys
 import threading
-import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from urllib.parse import unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -12,6 +13,8 @@ class HermesStub(BaseHTTPRequestHandler):
     runs = {}
     starts = []
     ready = threading.Event()
+    completion_released = threading.Event()
+    requested_paths = []
 
     def log_message(self, *_args):
         pass
@@ -36,11 +39,18 @@ class HermesStub(BaseHTTPRequestHandler):
         self._json(202, {"run_id": run_id, "status": "running"})
 
     def do_GET(self):
-        run_id = self.path.removeprefix("/v1/runs/")
+        self.requested_paths.append(self.path)
+        path = urlsplit(self.path).path
+        if not path.startswith("/v1/runs/"):
+            self._json(404, {"error": "not found"})
+            return
+        run_id = unquote(path.removeprefix("/v1/runs/"))
         run = self.runs.get(run_id)
         if run is None:
             self._json(404, {"error": "unknown run"})
             return
+        if self.completion_released.is_set():
+            run.update({"status": "completed", "output": "service is healthy"})
         self._json(200, run)
 
 
@@ -54,6 +64,8 @@ def start_stub():
     HermesStub.runs.clear()
     HermesStub.starts.clear()
     HermesStub.ready.clear()
+    HermesStub.completion_released.clear()
+    HermesStub.requested_paths.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), HermesStub)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -88,11 +100,20 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
         assert start_schema["required"] == ["prompt"]
         assert start_schema["properties"]["prompt"]["minLength"] == 1
 
-        began = time.monotonic()
-        started = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
             "name": "hermes_start_task", "arguments": {"prompt": "inspect the local service"}
-        }})
-        assert time.monotonic() - began < 1
+        }}
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            started_future = pool.submit(rpc, proc, request)
+            assert HermesStub.ready.wait(timeout=1), "Hermes did not receive the start request"
+            try:
+                started = started_future.result(timeout=1)
+                returned_while_running = True
+            except FutureTimeoutError:
+                HermesStub.completion_released.set()
+                started = started_future.result(timeout=1)
+                returned_while_running = False
+        assert returned_while_running, "start waited for the simulated Hermes run to complete"
         start_data = json.loads(started["result"]["content"][0]["text"])
         assert start_data == {"run_id": "run-stable-1", "status": "running", "hermes_status": "running"}
         assert HermesStub.starts == ["inspect the local service"]
@@ -105,9 +126,7 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
         assert active_data["status"] == "running"
         assert "result" not in active_data
 
-        HermesStub.runs["run-stable-1"] = {
-            "run_id": "run-stable-1", "status": "completed", "output": "service is healthy"
-        }
+        HermesStub.completion_released.set()
         completed = rpc(proc, {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
             "name": "hermes_get_task", "arguments": {"run_id": "run-stable-1"}
         }})
@@ -165,4 +184,28 @@ def test_status_works_after_adapter_restart_without_local_run_store():
         if second is not None:
             second.kill()
             second.wait()
+        stub.shutdown()
+
+
+
+def test_status_encodes_adversarial_run_id_as_one_path_segment():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    run_id = "folder/child?mode=admin#fragment%2Fsecret"
+    HermesStub.runs[run_id] = {"run_id": run_id, "status": "running"}
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        status = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_get_task", "arguments": {"run_id": run_id}
+        }})
+
+        status_data = json.loads(status["result"]["content"][0]["text"])
+        assert status_data["run_id"] == run_id
+        assert status_data["status"] == "running"
+        assert HermesStub.requested_paths == [
+            "/v1/runs/folder%2Fchild%3Fmode%3Dadmin%23fragment%252Fsecret"
+        ]
+    finally:
+        proc.kill()
+        proc.wait()
         stub.shutdown()
