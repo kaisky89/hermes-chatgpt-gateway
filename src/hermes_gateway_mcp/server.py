@@ -82,7 +82,7 @@ def _normalized_status(status: Any) -> str:
         return "completed"
     if value in {"failed", "failure", "error"}:
         return "failed"
-    if value in {"stopped", "stop", "cancelled", "canceled", "interrupted"}:
+    if value in {"stopped", "stopping", "stop", "cancelled", "canceled", "interrupted"}:
         return "stopped"
     if value in {
         "waiting",

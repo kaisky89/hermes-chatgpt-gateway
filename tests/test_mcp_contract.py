@@ -219,6 +219,21 @@ def test_public_mcp_normalizes_all_supported_lifecycle_states_and_preserves_meta
         stub.shutdown()
 
 
+def test_public_mcp_normalizes_transient_stopping_to_stopped():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    run_id = "run-stopping"
+    HermesStub.runs[run_id] = {"run_id": run_id, "status": "stopping"}
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_get_task", {"run_id": run_id})
+        assert data == {"run_id": run_id, "status": "stopped", "hermes_status": "stopping"}
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
 def test_public_mcp_isolates_multiple_runs_and_returns_stable_unknown_id_error():
     stub = start_stub()
     proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
