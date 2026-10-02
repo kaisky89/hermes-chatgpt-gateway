@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ENV_FILE=${HERMES_GATEWAY_ENV_FILE:-/home/pi/.config/hermes-chatgpt-gateway/hermes.env}
+
+if [ ! -r "$ENV_FILE" ]; then
+    printf 'Hermes MCP env file is not readable: %s\n' "$ENV_FILE" >&2
+    exit 1
+fi
+
+# The env file is trusted shell syntax and should be readable only by its owner.
+set -a
+. "$ENV_FILE"
+set +a
+
+cd "$PROJECT_DIR"
+exec uv run --project "$PROJECT_DIR" hermes-gateway-mcp

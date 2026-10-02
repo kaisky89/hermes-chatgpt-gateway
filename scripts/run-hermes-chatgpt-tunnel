@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+CONFIG_DIR=${HERMES_CHATGPT_CONFIG_DIR:-/home/pi/.config/hermes-chatgpt-gateway}
+OPENAI_ENV_FILE=${OPENAI_TUNNEL_ENV_FILE:-$CONFIG_DIR/openai-tunnel.env}
+HERMES_ENV_FILE=${HERMES_GATEWAY_ENV_FILE:-$CONFIG_DIR/hermes.env}
+TUNNEL_CLIENT_BIN=${TUNNEL_CLIENT_BIN:-tunnel-client}
+
+for env_file in "$OPENAI_ENV_FILE" "$HERMES_ENV_FILE"; do
+    if [ ! -r "$env_file" ]; then
+        printf 'Required env file is not readable: %s\n' "$env_file" >&2
+        exit 1
+    fi
+    # These files are trusted shell syntax; restrict them to the owner.
+    set -a
+    . "$env_file"
+    set +a
+done
+
+exec "$TUNNEL_CLIENT_BIN" run --profile hermes-chatgpt
