@@ -38,7 +38,9 @@ HERMES_GATEWAY_TIMEOUT=10
 
 The launcher sources this file as shell syntax, so keep it owner-controlled (for example, `chmod 600 /home/pi/.config/hermes-chatgpt-gateway/hermes.env`) and only put trusted assignments in it. The tunnel profile's MCP command should point to the absolute path of `scripts/run-hermes-gateway-mcp` on the Pi. The launcher uses `uv` from `PATH` and runs the project by its detected location.
 
-`HERMES_GATEWAY_URL` defaults to `http://127.0.0.1:8642`. `HERMES_GATEWAY_TIMEOUT` controls the bounded downstream request timeout in seconds.
+`HERMES_GATEWAY_URL` defaults to `http://127.0.0.1:8642` and must be an absolute HTTP(S) URL without embedded credentials, query strings, or fragments. Set `HERMES_GATEWAY_API_KEY` only in protected service/runtime configuration when the Gateway requires bearer authentication; it is never an MCP parameter and is never included in discovery or returned errors. `HERMES_GATEWAY_TIMEOUT` controls the bounded downstream request timeout in seconds (default 10, maximum 120). Invalid URL or timeout configuration causes the adapter to exit clearly at startup.
+
+The adapter categorizes only adapter-owned failures: `invalid input`, `invalid configuration`, `Gateway authentication failure`, `Gateway connectivity/timeout failure`, `malformed/unexpected response`, and `internal adapter failure`. Hermes HTTP errors retain their structured status and JSON error body. Logs are JSON records on stderr and contain request/run correlation IDs, but not credentials, authorization headers, prompts, or results. Keep the Gateway on loopback by default and protect the environment files as described below.
 
 The MCP server uses JSON-RPC over stdin/stdout, so it can be registered as a local stdio MCP server. It does not expose the Hermes Gateway itself.
 
