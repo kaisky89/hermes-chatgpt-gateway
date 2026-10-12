@@ -50,3 +50,5 @@ Run `git diff --check` before committing documentation changes.
 - No adapter-side run database, worker, or polling loop.
 - The Gateway should normally be loopback-only.
 - Independent of Telegram, Discord, Slack, and other Hermes interfaces.
+
+<!-- ChatGPT GitHub integration write-access smoke test (2026-10-12); remove before merging. -->
