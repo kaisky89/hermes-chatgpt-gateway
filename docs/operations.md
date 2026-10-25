@@ -94,11 +94,12 @@ Remove the installed user units, tunnel profile, and protected env files as appr
 The adapter follows these Hermes Runs API routes:
 
 - `POST /v1/runs`
+- `GET /v1/runs` (run collection listing; optional status, limit 1–100, opaque cursor)
 - `GET /v1/runs/{run_id}`
 - `POST /v1/runs/{run_id}/steer`
 - `POST /v1/runs/{run_id}/stop`
 
-It forwards structured Hermes errors and normalizes lifecycle status for MCP clients. Hermes API or MCP discovery changes require the contract tests to be updated together. The adapter remains independent of Telegram, Discord, Slack, and other Hermes interfaces.
+hermes_list_tasks returns run records only, never sessions, with normalized status, run ID, available timestamps, short description when provided, and pagination metadata. Inspected Gateway returned HTTP 405 for GET /v1/runs, so listing needs upstream collection support. Errors are forwarded. It forwards structured Hermes errors and normalizes lifecycle status for MCP clients. Hermes API or MCP discovery changes require the contract tests to be updated together. The adapter remains independent of Telegram, Discord, Slack, and other Hermes interfaces.
 
 ## V1 non-goals
 

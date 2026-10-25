@@ -7,7 +7,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 class HermesStub(BaseHTTPRequestHandler):
@@ -80,6 +80,10 @@ class HermesStub(BaseHTTPRequestHandler):
         self._json(202, {"run_id": run_id, "status": "running"})
 
     def do_GET(self):
+        if urlparse(self.path).path == "/v1/runs":
+            query = parse_qs(urlparse(self.path).query)
+            self._json(200, {"runs": list(self.runs.values())[:int(query.get("limit", [20])[0])], "next_cursor": None, "has_more": False})
+            return
         run_id = unquote(self.path.removeprefix("/v1/runs/"))
         run = self.runs.get(run_id)
         if run is None:
@@ -667,3 +671,42 @@ def test_hardening_validates_url_and_timeout_configuration():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+def test_public_mcp_lists_runs_without_confusing_sessions_and_supports_pagination():
+    stub = start_stub()
+    HermesStub.runs.update({
+        "run-active": {"run_id": "run-active", "status": "running", "created_at": "2026-10-01T10:00:00Z", "input": "Inspect deployment"},
+        "run-done": {"run_id": "run-done", "status": "completed", "completed_at": "2026-10-01T11:00:00Z"},
+    })
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        assert "hermes_list_tasks" in {t["name"] for t in tools["result"]["tools"]}
+        data = call_task(proc, 3, "hermes_list_tasks", {"limit": 2, "status": "running", "cursor": "opaque/token"})
+        assert {r["run_id"] for r in data["runs"]} == {"run-active", "run-done"}
+        assert data["runs"][0]["description"] == "Inspect deployment"
+        assert data["runs"][0]["created_at"] == "2026-10-01T10:00:00Z"
+        assert "session_id" not in json.dumps(data)
+        assert data["has_more"] is False
+        assert "next_cursor" in data
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_list_tasks_validates_pagination_without_gateway_call():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "hermes_list_tasks", "arguments": {"limit": 101}
+        }})
+        assert response["result"]["isError"] is True
+        assert "limit must be an integer" in response["result"]["content"][0]["text"]
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()

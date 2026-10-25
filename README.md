@@ -10,6 +10,7 @@ The adapter uses the Hermes Gateway Runs API over HTTP. The adapter does not exp
 
 ## MCP tools
 
+- `hermes_list_tasks` (requires Gateway collection-list support)
 - `hermes_start_task`
 - `hermes_get_task`
 - `hermes_steer_task`
