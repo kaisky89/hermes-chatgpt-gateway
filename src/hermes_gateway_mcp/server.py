@@ -29,6 +29,19 @@ TOOLS = [
         },
     },
     {
+        "name": "hermes_list_tasks",
+        "description": "List Hermes runs (not chat sessions), newest first. Requires Gateway support for GET /v1/runs; optional status filter and bounded pagination.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Optional normalized or native run status."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "cursor": {"type": "string", "description": "Opaque next-page cursor returned by the Gateway."}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "hermes_get_task",
         "description": "Retrieve the current status and, when complete, the result of a Hermes task by run ID.",
         "inputSchema": {
@@ -268,6 +281,35 @@ def _call_tool(name: str, arguments: Any, request_id: Any = None) -> dict[str, A
             run_id = response.get("run_id") or response.get("id")
             _log("hermes_start_task", request_id, run_id if isinstance(run_id, str) else None)
             return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
+        if name == "hermes_list_tasks":
+            unknown = set(arguments) - {"status", "limit", "cursor"}
+            if unknown:
+                raise InvalidInputError(f"unsupported arguments: {', '.join(sorted(unknown))}")
+            limit = arguments.get("limit", 20)
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                raise InvalidInputError("limit must be an integer from 1 to 100")
+            query: list[str] = [f"limit={limit}"]
+            status = arguments.get("status")
+            if status is not None:
+                query.append("status=" + quote(_validate_text(arguments, "status"), safe=""))
+            cursor = arguments.get("cursor")
+            if cursor is not None:
+                query.append("cursor=" + quote(_validate_text(arguments, "cursor"), safe=""))
+            response = _request("GET", "/v1/runs?" + "&".join(query), request_id=request_id)
+            runs = response.get("runs")
+            if not isinstance(runs, list):
+                raise MalformedResponseError("Gateway run listing must include a runs array")
+            items = [_run_response(run) for run in runs if isinstance(run, dict)]
+            for item, run in zip(items, (run for run in runs if isinstance(run, dict))):
+                description = run.get("description") or run.get("input")
+                if isinstance(description, str):
+                    item["description"] = description[:240]
+            result = {"runs": items}
+            for key in ("next_cursor", "has_more"):
+                if key in response:
+                    result[key] = response[key]
+            _log("hermes_list_tasks", request_id, count=len(items))
+            return {"content": [{"type": "text", "text": json.dumps(result, separators=(",", ":"))}]}
         if name == "hermes_get_task":
             run_id = _validate_text(arguments, "run_id")
             response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}", request_id=request_id)
