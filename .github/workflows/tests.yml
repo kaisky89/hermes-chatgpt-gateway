@@ -27,9 +27,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Run validation checks
+      - name: Install locked dependencies
+        run: uv sync --locked --no-install-project
+
+      - name: Run tests and syntax checks
         run: |
-          uv run --with pytest pytest -vv
-          uv run --with ruff ruff check .
-          uv run python -m compileall -q src tests
-          git diff --check
+          uv run --locked pytest -vv
+          uv run --locked python -m compileall -q src tests

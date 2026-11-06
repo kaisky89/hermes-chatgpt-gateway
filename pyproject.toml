@@ -11,6 +11,9 @@ requires-python = ">=3.9"
 [project.scripts]
 hermes-gateway-mcp = "hermes_gateway_mcp.server:main"
 
+[dependency-groups]
+dev = ["pytest==8.3.5"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_gateway_mcp"]
 
