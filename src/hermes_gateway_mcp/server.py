@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -20,10 +21,10 @@ logger = logging.getLogger("hermes_gateway_mcp")
 TOOLS = [
     {
         "name": "hermes_start_task",
-        "description": "Start a natural-language task in Hermes asynchronously and return its stable run ID.",
+        "description": "Start a task. For long tasks such as code changes or extensive analysis, set async=true so the calling chat or voice thread is not blocked; this returns a run ID immediately. For short tasks, omit async or set it false; the call waits up to HERMES_WAIT_TIMEOUT for completion. If it times out, use hermes_get_task later.",
         "inputSchema": {
             "type": "object",
-            "properties": {"prompt": {"type": "string", "description": "The objective for Hermes to execute.", "minLength": 1}},
+            "properties": {"prompt": {"type": "string", "description": "The objective for Hermes to execute.", "minLength": 1}, "async": {"type": "boolean", "description": "Set true for long tasks such as code changes or extensive analysis, so the calling chat or voice thread is not blocked; the tool returns a run ID immediately. Omit or set false for short tasks; the start call waits up to HERMES_WAIT_TIMEOUT, then returns the run ID if still active. After timeout, use hermes_get_task to check later."}},
             "required": ["prompt"],
             "additionalProperties": False,
         },
@@ -69,6 +70,7 @@ class Config:
     gateway_url: str
     timeout: float
     api_key: str | None
+    wait_timeout: float
 
 
 class AdapterError(Exception):
@@ -134,7 +136,13 @@ def _config() -> Config:
         raise ConfigurationError("HERMES_GATEWAY_TIMEOUT must be a number") from exc
     if not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise ConfigurationError(f"HERMES_GATEWAY_TIMEOUT must be greater than 0 and at most {MAX_TIMEOUT_SECONDS:g} seconds")
-    return Config(raw_url.rstrip("/"), timeout, os.getenv("HERMES_GATEWAY_API_KEY") or None)
+    try:
+        wait_timeout = float(os.getenv("HERMES_WAIT_TIMEOUT", "10"))
+    except ValueError as exc:
+        raise ConfigurationError("HERMES_WAIT_TIMEOUT must be a number") from exc
+    if not 0 <= wait_timeout <= MAX_TIMEOUT_SECONDS:
+        raise ConfigurationError(f"HERMES_WAIT_TIMEOUT must be between 0 and {MAX_TIMEOUT_SECONDS:g} seconds")
+    return Config(raw_url.rstrip("/"), timeout, os.getenv("HERMES_GATEWAY_API_KEY") or None, wait_timeout)
 
 
 def _log(event: str, request_id: Any = None, run_id: str | None = None, **fields: Any) -> None:
@@ -145,7 +153,7 @@ def _log(event: str, request_id: Any = None, run_id: str | None = None, **fields
     logger.info(json.dumps(record, separators=(",", ":"), sort_keys=True))
 
 
-def _request(method: str, path: str, payload: dict[str, Any] | None = None, *, request_id: Any = None) -> dict[str, Any]:
+def _request(method: str, path: str, payload: dict[str, Any] | None = None, *, request_id: Any = None, timeout: float | None = None) -> dict[str, Any]:
     try:
         config = _config()
         data = None if payload is None else json.dumps(payload).encode()
@@ -155,7 +163,7 @@ def _request(method: str, path: str, payload: dict[str, Any] | None = None, *, r
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
         request = Request(f"{config.gateway_url}{path}", data=data, headers=headers, method=method)
-        with urlopen(request, timeout=config.timeout) as response:
+        with urlopen(request, timeout=config.timeout if timeout is None else min(config.timeout, timeout)) as response:
             raw = response.read()
     except ConfigurationError:
         raise
@@ -264,10 +272,27 @@ def _call_tool(name: str, arguments: Any, request_id: Any = None) -> dict[str, A
             raise InvalidInputError("arguments must be an object")
         if name == "hermes_start_task":
             prompt = _validate_text(arguments, "prompt")
+            async_value = arguments.get("async", False)
+            if not isinstance(async_value, bool):
+                raise InvalidInputError("async must be a boolean")
             response = _request("POST", "/v1/runs", {"input": prompt}, request_id=request_id)
             run_id = response.get("run_id") or response.get("id")
+            run = response
+            config = _config()
+            deadline = time.monotonic() + config.wait_timeout
+            terminal = {"completed", "failed", "stopped"}
+            if isinstance(run_id, str) and not async_value:
+                while _normalized_status(run.get("status", run.get("state"))) not in terminal:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.1, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    run = _request("GET", f"/v1/runs/{quote(run_id, safe='')}", request_id=request_id, timeout=remaining)
             _log("hermes_start_task", request_id, run_id if isinstance(run_id, str) else None)
-            return {"content": [{"type": "text", "text": json.dumps(_run_response(response), separators=(",", ":"))}]}
+            return {"content": [{"type": "text", "text": json.dumps(_run_response(run), separators=(",", ":"))}]}
         if name == "hermes_get_task":
             run_id = _validate_text(arguments, "run_id")
             response = _request("GET", f"/v1/runs/{quote(run_id, safe='')}", request_id=request_id)

@@ -110,6 +110,7 @@ def start_stub():
 def start_adapter(url, **settings):
     env = os.environ.copy()
     env["HERMES_GATEWAY_URL"] = url
+    env["HERMES_WAIT_TIMEOUT"] = "0"
     env.update(settings)
     return subprocess.Popen(
         [sys.executable, "-m", "hermes_gateway_mcp.server"],
@@ -143,6 +144,10 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
         start_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_start_task")["inputSchema"]
         assert start_schema["required"] == ["prompt"]
         assert start_schema["properties"]["prompt"]["minLength"] == 1
+        async_description = start_schema["properties"]["async"]["description"]
+        assert "code changes" in async_description
+        assert "voice thread" in async_description
+        assert "hermes_get_task" in async_description
 
         began = time.monotonic()
         started = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
@@ -667,3 +672,36 @@ def test_hardening_validates_url_and_timeout_configuration():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+def test_public_mcp_async_true_returns_run_id_without_status_poll():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="10")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "long work", "async": True})
+        assert data["status"] == "running"
+        assert data["run_id"]
+        assert len(HermesStub.starts) == 1
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_start_accepts_zero_wait_budget_and_rejects_non_boolean_async():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="0")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "short work"})
+        assert data["status"] == "running"
+        invalid = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "hermes_start_task", "arguments": {"prompt": "bad async", "async": "true"}
+        }})
+        assert invalid["result"]["isError"] is True
+        assert "async must be a boolean" in invalid["result"]["content"][0]["text"]
+        assert HermesStub.starts == ["short work"]
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()

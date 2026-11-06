@@ -6,7 +6,7 @@ A thin stdio MCP adapter that exposes Hermes Gateway runs to ChatGPT through an 
 
 ChatGPT -> outbound tunnel -> stdio MCP adapter -> Hermes Gateway
 
-The adapter uses the Hermes Gateway Runs API over HTTP. The adapter does not expose an HTTP or LAN listener. Keep the Gateway loopback-only when the adapter and Gateway run on the same host.
+The adapter uses the Hermes Gateway Runs API over HTTP. By default, `hermes_start_task` waits up to `HERMES_WAIT_TIMEOUT` seconds (default: 10) and returns a completed result when available; otherwise it returns the run ID while Hermes continues. Set `async: true` for long tasks to return the run ID immediately. Use `hermes_get_task` for a status snapshot; it does not long-poll. `HERMES_GATEWAY_TIMEOUT` limits each HTTP request. The adapter does not expose an HTTP or LAN listener. Keep the Gateway loopback-only when both run on the same host.
 
 ## MCP tools
 

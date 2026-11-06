@@ -60,6 +60,7 @@ chmod 600 /home/pi/.config/tunnel-client/hermes-chatgpt.yaml
 ```sh
 HERMES_GATEWAY_URL=http://127.0.0.1:8642
 HERMES_GATEWAY_TIMEOUT=10
+HERMES_WAIT_TIMEOUT=10
 # HERMES_GATEWAY_API_KEY=...
 ```
 
