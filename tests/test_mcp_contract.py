@@ -731,7 +731,9 @@ def test_public_mcp_waits_for_fast_completion_and_returns_result():
         assert data["status"] == "completed"
         assert data["result"] == "done"
     finally:
-        proc.kill(); proc.wait(); stub.shutdown()
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
 
 
 def test_public_mcp_wait_budget_starts_after_creation_and_waiting_is_nonterminal():
@@ -744,7 +746,9 @@ def test_public_mcp_wait_budget_starts_after_creation_and_waiting_is_nonterminal
         assert data["run_id"] == "run-1" and data["status"] == "waiting"
         assert HermesStub.gets
     finally:
-        proc.kill(); proc.wait(); stub.shutdown()
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
 
 
 def test_public_mcp_slow_poll_timeout_is_limited_by_remaining_budget():
@@ -766,7 +770,9 @@ def test_public_mcp_slow_poll_timeout_is_limited_by_remaining_budget():
         # urllib's timeout is best-effort, not a strict wall-clock deadline.
         assert elapsed < 0.35
     finally:
-        proc.kill(); proc.wait(); stub.shutdown()
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
 
 
 def test_public_mcp_get_task_uses_one_status_snapshot():
@@ -778,4 +784,6 @@ def test_public_mcp_get_task_uses_one_status_snapshot():
         call_task(proc, 2, "hermes_get_task", {"run_id": "run-1"})
         assert HermesStub.gets == ["run-1"]
     finally:
-        proc.kill(); proc.wait(); stub.shutdown()
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
