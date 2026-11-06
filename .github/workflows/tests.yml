@@ -30,7 +30,9 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --no-install-project
 
-      - name: Run tests and syntax checks
+      - name: Run tests and validation checks
         run: |
           uv run --locked pytest -vv
+          uv run --locked ruff check .
           uv run --locked python -m compileall -q src tests
+          git diff --check
