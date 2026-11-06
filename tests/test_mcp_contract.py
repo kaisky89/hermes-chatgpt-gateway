@@ -756,7 +756,13 @@ def test_public_mcp_slow_poll_timeout_is_limited_by_remaining_budget():
         began = time.monotonic()
         response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hermes_start_task", "arguments": {"prompt": "slow status"}}})
         elapsed = time.monotonic() - began
-        assert response["result"]["isError"] is True  # best-effort socket timeout may expire first
+        assert response["result"].get("isError") is not True
+        data = json.loads(response["result"]["content"][0]["text"])
+        assert data == {
+            "run_id": "run-0", "status": "running", "hermes_status": "running",
+            "status_unknown": True, "status_stale": True,
+        }
+        assert HermesStub.gets == ["run-0"]
         # urllib's timeout is best-effort, not a strict wall-clock deadline.
         assert elapsed < 0.35
     finally:

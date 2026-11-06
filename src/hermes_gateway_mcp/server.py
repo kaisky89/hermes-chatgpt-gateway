@@ -233,6 +233,10 @@ def _run_response(run: dict[str, Any]) -> dict[str, Any]:
         raise InternalAdapterError("Gateway response did not include a run ID")
     original = run.get("status", run.get("state"))
     result: dict[str, Any] = {"run_id": run_id, "status": _normalized_status(original), "hermes_status": original}
+    if run.get("status_unknown") is True:
+        result["status_unknown"] = True
+    if run.get("status_stale") is True:
+        result["status_stale"] = True
     timestamps = run.get("timestamps")
     if isinstance(timestamps, dict):
         result["timestamps"] = timestamps
@@ -290,7 +294,13 @@ def _call_tool(name: str, arguments: Any, request_id: Any = None) -> dict[str, A
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
-                    run = _request("GET", f"/v1/runs/{quote(run_id, safe='')}", request_id=request_id, timeout=remaining)
+                    try:
+                        run = _request("GET", f"/v1/runs/{quote(run_id, safe='')}", request_id=request_id, timeout=remaining)
+                    except GatewayConnectivityError:
+                        # The POST succeeded, so preserve its known run ID and last
+                        # status when a bounded internal poll cannot reach the gateway.
+                        run = {**run, "status_unknown": True, "status_stale": True}
+                        break
             _log("hermes_start_task", request_id, run_id if isinstance(run_id, str) else None)
             return {"content": [{"type": "text", "text": json.dumps(_run_response(run), separators=(",", ":"))}]}
         if name == "hermes_get_task":
