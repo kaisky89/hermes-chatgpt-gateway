@@ -15,6 +15,8 @@ class HermesStub(BaseHTTPRequestHandler):
     starts: ClassVar[list] = []
     steers: ClassVar[list] = []
     stops: ClassVar[list] = []
+    gets: ClassVar[list] = []
+    get_delay = 0.0
     ready: ClassVar[threading.Event] = threading.Event()
     create_not_found = False
 
@@ -73,14 +75,17 @@ class HermesStub(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "create route not found", "type": "invalid_request_error", "code": "route_not_found", "param": None}})
             return
         prompt = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) ["input"]
-        run_id = "run-stable-1" if prompt in {"inspect the local service", "persist in Hermes"} else f"run-{len(self.runs) + 1}"
+        run_id = "run-stable-1" if prompt in {"inspect the local service", "persist in Hermes"} else f"run-{len(self.runs)}"
         self.starts.append(prompt)
-        self.runs[run_id] = {"run_id": run_id, "status": "running"}
+        self.runs[run_id] = {"run_id": run_id, "status": "waiting" if prompt == "needs input" else "running"}
         self.ready.set()
         self._json(202, {"run_id": run_id, "status": "running"})
 
     def do_GET(self):
         run_id = unquote(self.path.removeprefix("/v1/runs/"))
+        self.gets.append(run_id)
+        if self.get_delay:
+            time.sleep(self.get_delay)
         run = self.runs.get(run_id)
         if run is None:
             self._json(404, {"error": {"message": "run not found", "type": "invalid_request_error", "code": "run_not_found", "param": None}})
@@ -99,6 +104,8 @@ def start_stub():
     HermesStub.starts.clear()
     HermesStub.steers.clear()
     HermesStub.stops.clear()
+    HermesStub.gets.clear()
+    HermesStub.get_delay = 0.0
     HermesStub.ready.clear()
     HermesStub.create_not_found = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), HermesStub)
@@ -110,6 +117,7 @@ def start_stub():
 def start_adapter(url, **settings):
     env = os.environ.copy()
     env["HERMES_GATEWAY_URL"] = url
+    env["HERMES_WAIT_TIMEOUT"] = "0"
     env.update(settings)
     return subprocess.Popen(
         [sys.executable, "-m", "hermes_gateway_mcp.server"],
@@ -143,6 +151,10 @@ def test_public_mcp_start_and_status_are_async_and_stateless():
         start_schema = next(t for t in tools["result"]["tools"] if t["name"] == "hermes_start_task")["inputSchema"]
         assert start_schema["required"] == ["prompt"]
         assert start_schema["properties"]["prompt"]["minLength"] == 1
+        async_description = start_schema["properties"]["async"]["description"]
+        assert "code changes" in async_description
+        assert "voice thread" in async_description
+        assert "hermes_get_task" in async_description
 
         began = time.monotonic()
         started = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
@@ -667,3 +679,103 @@ def test_hardening_validates_url_and_timeout_configuration():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+def test_public_mcp_async_true_returns_run_id_without_status_poll():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="10")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "long work", "async": True})
+        assert data["status"] == "running"
+        assert data["run_id"]
+        assert len(HermesStub.starts) == 1
+        assert HermesStub.gets == []
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_start_accepts_zero_wait_budget_and_rejects_non_boolean_async():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="0")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "short work"})
+        assert data["status"] == "running"
+        invalid = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "hermes_start_task", "arguments": {"prompt": "bad async", "async": "true"}
+        }})
+        assert invalid["result"]["isError"] is True
+        assert "async must be a boolean" in invalid["result"]["content"][0]["text"]
+        assert HermesStub.starts == ["short work"]
+    finally:
+        proc.kill()
+        proc.wait()
+        stub.shutdown()
+
+
+def test_public_mcp_waits_for_fast_completion_and_returns_result():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="1")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        def complete_soon():
+            assert HermesStub.ready.wait(1)
+            time.sleep(0.05)
+            HermesStub.runs["run-0"] = {"run_id": "run-0", "status": "completed", "output": "done"}
+        worker = threading.Thread(target=complete_soon)
+        worker.start()
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "fast work"})
+        worker.join()
+        assert data["status"] == "completed"
+        assert data["result"] == "done"
+    finally:
+        proc.kill(); proc.wait(); stub.shutdown()
+
+
+def test_public_mcp_wait_budget_starts_after_creation_and_waiting_is_nonterminal():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="0.15")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        HermesStub.runs["run-1"] = {"run_id": "run-1", "status": "waiting"}
+        data = call_task(proc, 2, "hermes_start_task", {"prompt": "needs input"})
+        assert data["run_id"] == "run-1" and data["status"] == "waiting"
+        assert HermesStub.gets
+    finally:
+        proc.kill(); proc.wait(); stub.shutdown()
+
+
+def test_public_mcp_slow_poll_timeout_is_limited_by_remaining_budget():
+    stub = start_stub()
+    HermesStub.get_delay = 0.4
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}", HERMES_WAIT_TIMEOUT="0.12", HERMES_GATEWAY_TIMEOUT="2")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        began = time.monotonic()
+        response = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hermes_start_task", "arguments": {"prompt": "slow status"}}})
+        elapsed = time.monotonic() - began
+        assert response["result"].get("isError") is not True
+        data = json.loads(response["result"]["content"][0]["text"])
+        assert data == {
+            "run_id": "run-0", "status": "running", "hermes_status": "running",
+            "status_unknown": True, "status_stale": True,
+        }
+        assert HermesStub.gets == ["run-0"]
+        # urllib's timeout is best-effort, not a strict wall-clock deadline.
+        assert elapsed < 0.35
+    finally:
+        proc.kill(); proc.wait(); stub.shutdown()
+
+
+def test_public_mcp_get_task_uses_one_status_snapshot():
+    stub = start_stub()
+    proc = start_adapter(f"http://127.0.0.1:{stub.server_port}")
+    try:
+        rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        HermesStub.runs["run-1"] = {"run_id": "run-1", "status": "running"}
+        call_task(proc, 2, "hermes_get_task", {"run_id": "run-1"})
+        assert HermesStub.gets == ["run-1"]
+    finally:
+        proc.kill(); proc.wait(); stub.shutdown()
