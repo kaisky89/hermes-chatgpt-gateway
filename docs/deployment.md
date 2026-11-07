@@ -60,11 +60,13 @@ chmod 600 /home/pi/.config/tunnel-client/hermes-chatgpt.yaml
 ```sh
 HERMES_GATEWAY_URL=http://127.0.0.1:8642
 HERMES_GATEWAY_TIMEOUT=10
-HERMES_WAIT_TIMEOUT=10
+HERMES_WAIT_TIMEOUT=30
 # HERMES_GATEWAY_API_KEY=...
 ```
 
 Set `HERMES_GATEWAY_URL` to the existing Gateway address. Use a loopback address when the adapter and Gateway are colocated.
+
+`HERMES_WAIT_TIMEOUT` is the adapter's synchronous `hermes_start_task(async=false)` wait budget (default: 30 seconds). It does not change `HERMES_GATEWAY_TIMEOUT`, which caps each individual Gateway HTTP request, or the outbound tunnel's own limits. Set this below the caller/platform deadline; 30 seconds leaves margin under a 60-second caller limit.
 
 `openai-tunnel.env` contains the tunnel credentials:
 

@@ -137,7 +137,7 @@ def _config() -> Config:
     if not 0 < timeout <= MAX_TIMEOUT_SECONDS:
         raise ConfigurationError(f"HERMES_GATEWAY_TIMEOUT must be greater than 0 and at most {MAX_TIMEOUT_SECONDS:g} seconds")
     try:
-        wait_timeout = float(os.getenv("HERMES_WAIT_TIMEOUT", "10"))
+        wait_timeout = float(os.getenv("HERMES_WAIT_TIMEOUT", "30"))
     except ValueError as exc:
         raise ConfigurationError("HERMES_WAIT_TIMEOUT must be a number") from exc
     if not 0 <= wait_timeout <= MAX_TIMEOUT_SECONDS:
